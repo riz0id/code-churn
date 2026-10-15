@@ -15,6 +15,12 @@ ChurnKind = Literal["modified", "deleted"]
 GroupBy = Literal["author", "filetype"]
 
 
+def author_name(author: str) -> str:
+    """Name part of 'Name <email>'. A name containing ' <' truncates at the
+    first occurrence; display (plot) and --exclude-author share this rule."""
+    return author.split(" <", 1)[0]
+
+
 @dataclass(frozen=True, slots=True)
 class LineOrigin:
     """Provenance of one line of a tracked file.
@@ -56,6 +62,14 @@ class AnalysisResult:
     # Same lifetimes keyed by group label; only populated when the config
     # sets survival_group_by (alongside collect_survival).
     survival_by_group: dict[str, SurvivalData] | None = None
+    # (birth_time, death_time | None) per in-range, non-excluded line; only
+    # populated when the config sets collect_lifespans. None death = alive
+    # at the end of the walk.
+    lifespans: list[tuple[int, int | None]] | None = None
+    # Time of the newest walked commit; set alongside lifespans (censoring
+    # ages at any cutoff need it, and it cannot be derived from lifespans
+    # alone when the newest commits touch no tracked lines).
+    observation_end: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +83,19 @@ class AnalysisConfig:
     # cross `/`) tested against a line's add-time path. Matching lines count
     # neither as added nor as churned.
     exclude: tuple[str, ...] = ()
+    # Contents (text) of an external mailmap in standard git mailmap format,
+    # applied by gitwalk after the repo's own mailmap: external entries match
+    # the repo-resolved identity and take effect last (see README). The CLI
+    # reads the file so gitwalk stays free of filesystem I/O.
+    mailmap: str | None = None
+    # The CLI path the mailmap text came from; echoed in output only.
+    mailmap_path: str | None = None
+    # Author names (the part of "Name <email>" before " <", post-mailmap),
+    # matched exactly and case-sensitively. Excluded in both roles: their
+    # lines count neither as added nor churned, and churn they perform is
+    # dropped entirely (the victim line's death goes unrecorded — neither
+    # event nor censored observation, so its exposure leaves --fit-decay).
+    exclude_authors: tuple[str, ...] = ()
     # Collect survival data (lifetimes of churned and surviving in-range
     # lines) for decay fitting. Ignores the window: the full history is
     # walked so churn past `until + window` is observed, not miscounted as
@@ -77,6 +104,10 @@ class AnalysisConfig:
     # Additionally label survival data per group for stratified decay fits.
     # Only takes effect when collect_survival is set.
     survival_group_by: GroupBy | None = None
+    # Collect per-line (birth, death | None) pairs so the decay fit can be
+    # recomputed at any historical cutoff (--churn-timeline). Like
+    # collect_survival, this ignores the window and walks the full history.
+    collect_lifespans: bool = False
 
 
 @dataclass(slots=True)

@@ -85,6 +85,9 @@ def test_json_round_trips_and_has_events() -> None:
     assert authors[BOB]["churn_rate"] is None  # added nothing
     assert payload["events"][0]["origin_commit"] == "c1"
     assert payload["events"][0]["kind"] == "modified"
+    # Author-identity defaults are present (and null/empty) in the config.
+    assert payload["config"]["mailmap"] is None
+    assert payload["config"]["exclude_authors"] == []
 
 
 def test_csv_file_section() -> None:

@@ -39,12 +39,17 @@ def open_repo(path: str) -> pygit2.Repository:
         raise ValueError(f"not a git repository: {path}") from exc
 
 
-def walk_first_parent(repo: pygit2.Repository, rev: str) -> Iterator[CommitDiff]:
+def walk_first_parent(
+    repo: pygit2.Repository, rev: str, extra_mailmap: str | None = None
+) -> Iterator[CommitDiff]:
     """Yield first-parent history of ``rev``, oldest first, with diffs.
 
     First-parent simplification makes the walk a linear chain: each yielded
     commit's first parent is the previously yielded commit, so applying the
     diffs in order keeps an OriginMap positionally exact.
+
+    ``extra_mailmap`` is the text of an external mailmap (standard git
+    format), resolved after the repo's own mailmap.
     """
     try:
         tip = repo.revparse_single(rev).peel(pygit2.Commit)
@@ -55,6 +60,13 @@ def walk_first_parent(repo: pygit2.Repository, rev: str) -> Iterator[CommitDiff]
         mailmap = pygit2.Mailmap.from_repository(repo)
     except pygit2.GitError:
         mailmap = None
+
+    extra = None
+    if extra_mailmap is not None:
+        try:
+            extra = pygit2.Mailmap.from_buffer(extra_mailmap)
+        except pygit2.GitError as exc:  # defensive; libgit2's parser is lenient
+            raise ValueError("invalid --mailmap file") from exc
 
     walker = repo.walk(tip.id, SortMode.TOPOLOGICAL | SortMode.TIME | SortMode.REVERSE)
     walker.simplify_first_parent()
@@ -74,7 +86,19 @@ def walk_first_parent(repo: pygit2.Repository, rev: str) -> Iterator[CommitDiff]
         if mailmap is not None:
             try:
                 sig = mailmap.resolve_signature(sig)
-            except pygit2.GitError:
+            except (pygit2.GitError, ValueError):
+                # ValueError: commits authored by ancient git versions can
+                # carry an empty name or email (e.g. in node.js history),
+                # which resolve_signature refuses to rebuild. Keep the raw
+                # signature rather than dying mid-walk.
+                pass
+        if extra is not None:
+            # Applied second, so external entries win — but they match the
+            # repo-resolved identity, and chain through it (repo maps A->B,
+            # external maps B->C => C), unlike git's merged-map semantics.
+            try:
+                sig = extra.resolve_signature(sig)
+            except (pygit2.GitError, ValueError):
                 pass
         author = f"{sig.name} <{sig.email}>"
 

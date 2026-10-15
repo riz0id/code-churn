@@ -66,6 +66,10 @@ def _summary_lines(report: RepoReport) -> list[str]:
     ]
     if config.exclude:
         lines.append("exclude: " + ", ".join(config.exclude))
+    if config.mailmap_path:
+        lines.append(f"mailmap: {config.mailmap_path}")
+    if config.exclude_authors:
+        lines.append("exclude authors: " + ", ".join(config.exclude_authors))
     lines += [
         "",
         f"lines added:   {report.totals.added}",
@@ -240,6 +244,8 @@ def render_json(report: RepoReport) -> str:
             "since": report.config.since,
             "until": report.config.until,
             "exclude": list(report.config.exclude),
+            "mailmap": report.config.mailmap_path,
+            "exclude_authors": list(report.config.exclude_authors),
         },
         "generated_at": report.generated_at,
         "summary": {

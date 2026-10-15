@@ -18,8 +18,11 @@ def run(
     since: int | None = None,
     until: int | None = None,
     exclude: tuple[str, ...] = (),
+    mailmap: str | None = None,
+    exclude_authors: tuple[str, ...] = (),
     collect_survival: bool = False,
     survival_group_by: GroupBy | None = None,
+    collect_lifespans: bool = False,
 ) -> AnalysisResult:
     config = AnalysisConfig(
         repo_path=str(repo.path),
@@ -28,8 +31,11 @@ def run(
         since=since,
         until=until,
         exclude=exclude,
+        mailmap=mailmap,
+        exclude_authors=exclude_authors,
         collect_survival=collect_survival,
         survival_group_by=survival_group_by,
+        collect_lifespans=collect_lifespans,
     )
     return analyze(config)
 
@@ -426,6 +432,160 @@ def test_survival_by_group_moved_line_keeps_origin_suffix(repo: RepoBuilder) -> 
     assert groups is not None
     assert groups[".py"].event_lifetimes == [10 * DAY]
     assert groups[".c"].event_lifetimes == []
+
+
+def test_lifespans_not_collected_by_default(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0))
+    result = run(repo)
+    assert result.lifespans is None
+    assert result.observation_end is None
+
+
+def test_lifespans_record_birth_and_death(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\nbeta = 2\n"}, when=day(0))
+    repo.commit({"a.py": "alpha = 1\nbeta = 99\n"}, when=day(10))
+    result = run(repo, collect_lifespans=True)
+    assert result.observation_end == day(10)
+    assert result.lifespans is not None
+    # beta died at day 10; alpha and beta's replacement are alive.
+    assert sorted(result.lifespans, key=lambda p: (p[0], p[1] or 0)) == [
+        (day(0), None),
+        (day(0), day(10)),
+        (day(10), None),
+    ]
+
+
+def test_lifespans_walk_continues_past_until_plus_window(repo: RepoBuilder) -> None:
+    # collect_lifespans alone (without collect_survival) must disable the
+    # until + window early-stop, or the day(40) death looks like survival.
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0))
+    repo.commit({"a.py": "alpha = 2\n"}, when=day(40))
+    result = run(repo, until=day(1), collect_lifespans=True)
+    assert result.lifespans is not None
+    assert (day(0), day(40)) in result.lifespans
+
+
+def test_lifespans_respect_exclusions(repo: RepoBuilder) -> None:
+    repo.commit(
+        {"gen/out.c": "generated_code();\n", "src.py": "handwritten = 1\n"},
+        when=day(0),
+    )
+    repo.commit({"gen/out.c": "regenerated_code();\n"}, when=day(10))
+    result = run(repo, exclude=("gen/**",), collect_lifespans=True)
+    # Only src.py's surviving line counts; gen/** appears nowhere.
+    assert result.lifespans == [(day(0), None)]
+
+
+def test_lifespans_moved_line_keeps_original_birth(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "moved_function_call()\n"}, when=day(0))
+    repo.commit({"b.py": "moved_function_call()\n", "a.py": None}, when=day(5))
+    repo.commit({"b.py": "changed_function_call()\n"}, when=day(10))
+    result = run(repo, collect_lifespans=True)
+    assert result.lifespans is not None
+    # Birth is the original add (day 0), not the move (day 5).
+    assert (day(0), day(10)) in result.lifespans
+
+
+def test_mailmap_joins_added_and_churn_attribution(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0), author="alice2")
+    repo.commit({"a.py": "alpha = 2\n"}, when=day(10), author="bob")
+    mailmap = "alice <alice@example.com> <alice2@example.com>\n"
+    result = run(repo, mailmap=mailmap)
+    assert len(result.events) == 1
+    assert result.events[0].origin_author == "alice <alice@example.com>"
+    assert set(result.added) == {
+        ("a.py", "alice <alice@example.com>"),
+        ("a.py", "bob <bob@example.com>"),
+    }
+
+
+def test_mailmap_joins_survival_groups(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0), author="alice")
+    repo.commit({"b.py": "bravo = 1\n"}, when=day(0), author="alice2")
+    repo.commit({"b.py": "bravo = 2\n"}, when=day(10), author="bob")
+    mailmap = "alice <alice@example.com> <alice2@example.com>\n"
+    result = run(
+        repo, mailmap=mailmap, collect_survival=True, survival_group_by="author"
+    )
+    assert result.survival_by_group is not None
+    merged = result.survival_by_group["alice <alice@example.com>"]
+    # alice2's b.py line (died at day 10) lands in alice's stratum; alice's
+    # own a.py line is censored at 10 days.
+    assert merged.event_lifetimes == [10 * DAY]
+    assert merged.censored_ages == [10 * DAY]
+    assert "alice2 <alice2@example.com>" not in result.survival_by_group
+
+
+def test_mailmap_applies_after_repo_mailmap(repo: RepoBuilder) -> None:
+    # The external mailmap resolves AFTER the repo's own .mailmap, so its
+    # entries must be keyed on the repo-resolved identity — and chain.
+    (repo.path / ".mailmap").write_text("Repo Alice <ralice@x> <alice@example.com>\n")
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0), author="alice")
+    result = run(repo, mailmap="Final Alice <falice@x> <ralice@x>\n")
+    assert set(result.added) == {("a.py", "Final Alice <falice@x>")}
+
+
+def test_exclude_author_removes_added_and_received_churn(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0), author="alice")
+    repo.commit({"b.py": "bravo = 1\n"}, when=day(0), author="bob")
+    repo.commit({"a.py": "alpha = 2\n"}, when=day(10), author="bob")
+    result = run(repo, exclude_authors=("alice",))
+    # alice's add and the churn of her line are gone; bob's lines remain
+    # (including his replacement line in a.py).
+    assert result.events == []
+    assert result.added == {
+        ("b.py", "bob <bob@example.com>"): 1,
+        ("a.py", "bob <bob@example.com>"): 1,
+    }
+
+
+def test_exclude_author_as_churner_drops_victim_death(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0), author="alice")
+    repo.commit({"a.py": "alpha = 2\n"}, when=day(10), author="renovate")
+    result = run(
+        repo,
+        exclude_authors=("renovate",),
+        collect_survival=True,
+        collect_lifespans=True,
+    )
+    assert result.events == []
+    assert result.survival is not None
+    # The victim's death is recorded nowhere: not an event, not a survival
+    # death — and the line left the origin map, so it is never censored
+    # either. Its exposure drops out of --fit-decay entirely.
+    assert result.survival.event_lifetimes == []
+    assert result.survival.censored_ages == []
+    assert result.lifespans == []
+    assert result.added == {("a.py", "alice <alice@example.com>"): 1}
+
+
+def test_exclude_author_vanishes_from_groups_and_lifespans(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0), author="alice")
+    repo.commit({"b.py": "bravo = 1\n"}, when=day(0), author="bot")
+    repo.commit({"b.py": "bravo = 2\n"}, when=day(10), author="bot")
+    result = run(
+        repo,
+        exclude_authors=("bot",),
+        collect_survival=True,
+        survival_group_by="author",
+        collect_lifespans=True,
+    )
+    assert result.survival_by_group is not None
+    assert set(result.survival_by_group) == {"alice <alice@example.com>"}
+    assert result.lifespans == [(day(0), None)]
+
+
+def test_exclude_author_is_case_sensitive(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0), author="Alice")
+    result = run(repo, exclude_authors=("alice",))
+    assert set(result.added) == {("a.py", "Alice <Alice@example.com>")}
+
+
+def test_exclude_author_matches_post_mailmap_name(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0), author="alice2")
+    mailmap = "alice <alice@example.com> <alice2@example.com>\n"
+    result = run(repo, mailmap=mailmap, exclude_authors=("alice",))
+    assert result.added == {}
 
 
 def test_multiple_repos_fixture(make_repo: Callable[[], RepoBuilder]) -> None:

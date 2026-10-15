@@ -16,6 +16,8 @@ code-churn /path/to/repo --window 90d
 code-churn . --since 2025-01-01 --until 2025-06-30 --format json
 code-churn . --by author --format csv --output churn.csv
 code-churn . --exclude '**/*.ipynb' --exclude 'vendor/**'   # skip generated/vendored files
+code-churn . --mailmap team.mailmap                         # join author identities (git mailmap format)
+code-churn . --exclude-author 'renovate[bot]'               # drop an author entirely (both roles)
 code-churn . --fit-decay                                    # fit the repo's own decay timescale
 code-churn . --decay-plot churn-decay.png                   # ...and graph it (.png/.svg/.pdf)
 code-churn . --group-by author                              # per-group fits + likelihood-ratio test
@@ -116,6 +118,28 @@ code-churn . --churn-heatmap live
 
 Axes are truncated to the 20 most-involved authors when there are more.
 
+### Animated decay timeline
+
+`--churn-timeline TARGET` animates the decay fit's month-by-month evolution
+as data accrues: each frame refits the exponential using only what was
+observable at that month's end — churn that had already happened counts as a
+death with its exact lifetime, and every line alive at that moment is
+right-censored at its age then. The top panel shows the fitted survival curve
+sliding as the half-life converges (or drifts, if the repo's churn regime
+changes); the bottom panel shows churn per calendar month with the current
+month highlighted and a half-life trace accumulating. The animation plays in
+a loop. TARGET is a `.gif` path (written by pillow, loops natively) or the
+literal `live` for an interactive matplotlib window:
+
+```sh
+code-churn . --churn-timeline decay.gif
+code-churn . --churn-timeline live
+```
+
+Early frames fit on little data and swing before stabilizing — expected, and
+the standard caveat machinery applies to each frame's fit. Like `--fit-decay`,
+the timeline walks the full history regardless of `--window`.
+
 ## How churn is measured
 
 - **Line-level, single pass.** History is walked oldest→newest along
@@ -151,6 +175,20 @@ Axes are truncated to the 20 most-involved authors when there are more.
   excluded file stays excluded even after being moved into an included file,
   and a line born in an included file still counts if it churns after moving
   into an excluded one.
+- **`--mailmap FILE` joins author identities.** FILE uses standard git
+  mailmap format. It supplements the repository's own `.mailmap` (and
+  `mailmap.file`/`mailmap.blob` config) and is applied after it, so its
+  entries take effect last — but they match the *repo-resolved* identity:
+  key entries on the identity the tool reports without `--mailmap`. All
+  reports (author table, `--group-by author`, the heatmap) see the joined
+  identity.
+- **`--exclude-author NAME` drops an author in both roles.** NAME is the
+  exact, case-sensitive name part of `Name <email>`, after mailmap
+  resolution. Their lines count neither as added nor as churned, and churn
+  they perform on others' lines is ignored — such a victim line's death is
+  recorded nowhere, so under `--fit-decay` its exposure leaves the fit
+  entirely (a small survivorship bias toward longer half-lives). Typical
+  use: bots and code formatters.
 - Binary files are skipped. When git's binary detection flips for a file
   across history (e.g. added as "binary", later diffed as text), lines from
   the untracked period simply have no provenance: they never count as added

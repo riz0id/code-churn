@@ -17,6 +17,7 @@ from code_churn.engine import analyze
 from code_churn.formatters import render_csv, render_json, render_table
 from code_churn.model import AnalysisConfig, GroupBy
 from code_churn.report import build_report, churn_matrix
+from code_churn.timeline import build_timeline
 
 _DURATION_UNITS = {
     "h": 3_600,
@@ -27,6 +28,9 @@ _DURATION_UNITS = {
 # Image formats accepted by --decay-plot (savefig picks the backend from the
 # extension).
 _PLOT_EXTENSIONS = (".png", ".svg", ".pdf")
+
+# Animation formats accepted by --churn-timeline (pillow writes the gif).
+_ANIMATION_EXTENSIONS = (".gif",)
 
 EPILOG = """\
 churn definition:
@@ -42,6 +46,20 @@ exclusions:
   `**` recurses, so use --exclude '**/*.c' for all C files at any depth or
   --exclude 'vendor/**' for a subtree. Excluded lines count neither as added
   nor as churned.
+
+author identity:
+  --mailmap FILE joins author identities using an extra mailmap file in
+  standard git mailmap format. It supplements the repository's own .mailmap
+  (and mailmap.file/mailmap.blob config) and is applied after it, so its
+  entries win — but they match the repo-resolved identity: to override a repo
+  .mailmap entry, key yours on the identity this tool reports without
+  --mailmap.
+
+  --exclude-author NAME matches the author's name exactly (case-sensitive,
+  after mailmap resolution). Excluded authors' lines count neither as added
+  nor as churned, and churn they perform on others' lines is ignored — such a
+  victim line's death is recorded nowhere, so with --fit-decay its exposure
+  drops out of the fit entirely. Typical use: bots and code formatters.
 
 decay fitting:
   --fit-decay models line survival as exponential decay S(t) = exp(-lambda*t)
@@ -64,6 +82,14 @@ cross-author churn:
   original author on rows and the churning author on columns (the diagonal
   is self-churn). TARGET is an image path (.png/.svg/.pdf) or the literal
   'live' to open an interactive matplotlib window.
+
+churn timeline:
+  --churn-timeline TARGET animates the decay fit's evolution: each frame
+  refits the exponential using only what was observable at that month's end
+  (churn so far = deaths; everything else right-censored at its age then),
+  with a monthly churn-activity bar chart below. The animation loops.
+  TARGET is a .gif path or the literal 'live'. Walks the full history like
+  --fit-decay.
 """
 
 
@@ -124,6 +150,24 @@ def build_parser() -> argparse.ArgumentParser:
         "glob (repeatable; `**` recurses, e.g. '**/*.c', 'vendor/**')",
     )
     parser.add_argument(
+        "--mailmap",
+        metavar="FILE",
+        help="join author identities using an extra mailmap file (standard "
+        "git mailmap format), applied after the repo's own .mailmap "
+        "(see epilog)",
+    )
+    parser.add_argument(
+        "--exclude-author",
+        action="append",
+        default=[],
+        dest="exclude_author",
+        metavar="NAME",
+        help="exclude an author by exact, case-sensitive NAME (the part of "
+        "'Name <email>' before the email), after mailmap resolution; their "
+        "lines count neither as added nor churned, and churn they perform "
+        "is ignored (repeatable)",
+    )
+    parser.add_argument(
         "--format",
         choices=["table", "json", "csv"],
         default="table",
@@ -159,6 +203,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="render the origin-author x churn-author heatmap; TARGET is an "
         "image path (.png/.svg/.pdf) or 'live' for an interactive window",
     )
+    parser.add_argument(
+        "--churn-timeline",
+        metavar="TARGET",
+        help="animate the decay fit's month-by-month evolution as a looping "
+        "graph; TARGET is a .gif path or 'live' for an interactive window",
+    )
     parser.add_argument("--output", metavar="PATH", help="write output to a file")
     parser.add_argument("--version", action="version", version=__version__)
     return parser
@@ -181,6 +231,18 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             print(f"error: invalid --exclude pattern {pattern!r}", file=sys.stderr)
             return 2
+    for name in args.exclude_author:
+        if not name:
+            print("error: invalid --exclude-author name ''", file=sys.stderr)
+            return 2
+
+    mailmap_text: str | None = None
+    if args.mailmap is not None:
+        try:
+            mailmap_text = Path(args.mailmap).read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"error: cannot read --mailmap file: {exc}", file=sys.stderr)
+            return 2
 
     if args.decay_plot and Path(args.decay_plot).suffix.lower() not in _PLOT_EXTENSIONS:
         print(
@@ -202,6 +264,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    timeline_live = args.churn_timeline == "live"
+    if (
+        args.churn_timeline
+        and not timeline_live
+        and Path(args.churn_timeline).suffix.lower() not in _ANIMATION_EXTENSIONS
+    ):
+        print(
+            "error: --churn-timeline must be 'live' or end in .gif",
+            file=sys.stderr,
+        )
+        return 2
+
     fit_requested = (
         args.fit_decay or args.decay_plot is not None or args.group_by is not None
     )
@@ -213,8 +287,12 @@ def main(argv: list[str] | None = None) -> int:
         since=args.since,
         until=args.until,
         exclude=tuple(args.exclude),
+        mailmap=mailmap_text,
+        mailmap_path=args.mailmap,
+        exclude_authors=tuple(args.exclude_author),
         collect_survival=fit_requested,
         survival_group_by=cast("GroupBy | None", args.group_by),
+        collect_lifespans=args.churn_timeline is not None,
     )
     try:
         result = analyze(config)
@@ -236,12 +314,12 @@ def main(argv: list[str] | None = None) -> int:
         stratified=stratified,
     )
 
-    if args.decay_plot or args.churn_heatmap:
+    if args.decay_plot or args.churn_heatmap or args.churn_timeline:
         # Lazy import: only plotting runs pay the matplotlib cost.
         from code_churn import plot
 
-        plot.configure(live=heatmap_live)
-        if heatmap_live and not plot.is_interactive():
+        plot.configure(live=heatmap_live or timeline_live)
+        if (heatmap_live or timeline_live) and not plot.is_interactive():
             print(
                 "warning: no interactive matplotlib backend available; "
                 "nothing will be displayed",
@@ -263,6 +341,16 @@ def main(argv: list[str] | None = None) -> int:
         plot.render_churn_heatmap(
             churn_matrix(report.events),
             path=None if heatmap_live else args.churn_heatmap,
+        )
+
+    if args.churn_timeline:
+        if not result.lifespans:
+            print("error: no in-range lines; nothing to animate", file=sys.stderr)
+            return 1
+        assert result.observation_end is not None  # collect_lifespans was set
+        timeline = build_timeline(result.lifespans, result.observation_end)
+        plot.render_churn_timeline(
+            timeline, path=None if timeline_live else args.churn_timeline
         )
 
     if args.format == "json":

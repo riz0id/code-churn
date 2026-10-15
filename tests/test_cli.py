@@ -128,6 +128,70 @@ def test_invalid_exclude_pattern_rejected(
     assert "invalid --exclude pattern" in capsys.readouterr().err
 
 
+def test_mailmap_flag_joins_authors_and_echoes_config(
+    churned_repo: RepoBuilder, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    mailmap = tmp_path / "team.mailmap"
+    mailmap.write_text("alice <alice@example.com> <bob@example.com>\n")
+    code = main([str(churned_repo.path), "--mailmap", str(mailmap), "--format", "json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["config"]["mailmap"] == str(mailmap)
+    assert [a["author"] for a in payload["authors"]] == ["alice <alice@example.com>"]
+    assert payload["events"][0]["churn_author"] == "alice <alice@example.com>"
+
+
+def test_mailmap_unreadable_file_rejected(
+    churned_repo: RepoBuilder, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main([str(churned_repo.path), "--mailmap", str(tmp_path / "missing.map")])
+    assert code == 2
+    assert "cannot read --mailmap" in capsys.readouterr().err
+
+
+def test_exclude_author_filters_and_echoes_config(
+    churned_repo: RepoBuilder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main([str(churned_repo.path), "--exclude-author", "bob", "--format", "json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["config"]["exclude_authors"] == ["bob"]
+    # bob's churn of alice's line and his replacement line are both dropped.
+    assert payload["summary"] == {"added": 2, "churned": 0, "churn_rate": 0.0}
+    assert [a["author"] for a in payload["authors"]] == ["alice <alice@example.com>"]
+
+
+def test_exclude_author_listed_in_table_summary(
+    churned_repo: RepoBuilder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main([str(churned_repo.path), "--exclude-author", "bob"]) == 0
+    assert "exclude authors: bob" in capsys.readouterr().out
+
+
+def test_invalid_exclude_author_rejected(
+    churned_repo: RepoBuilder, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main([str(churned_repo.path), "--exclude-author", ""]) == 2
+    assert "invalid --exclude-author" in capsys.readouterr().err
+
+
+def test_exclude_author_empties_heatmap(
+    churned_repo: RepoBuilder, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "churn.png"
+    code = main(
+        [
+            str(churned_repo.path),
+            "--exclude-author",
+            "bob",
+            "--churn-heatmap",
+            str(target),
+        ]
+    )
+    assert code == 1
+    assert "no churn events" in capsys.readouterr().err
+
+
 def test_bad_range_rejected(
     churned_repo: RepoBuilder, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -271,4 +335,58 @@ def test_churn_heatmap_live_calls_show(
     calls: list[bool] = []
     monkeypatch.setattr(plt, "show", lambda: calls.append(True))
     assert main([str(churned_repo.path), "--churn-heatmap", "live"]) == 0
+    assert calls == [True]
+
+
+@pytest.fixture
+def timeline_repo(repo: RepoBuilder) -> RepoBuilder:
+    # Three calendar months of history (T0 = 2023-11-14) with churn in the
+    # second and third, keeping the GIF tiny (3 frames).
+    repo.commit({"a.py": "alpha = 1\nbeta = 2\n"}, when=day(0), author="alice")
+    repo.commit({"a.py": "alpha = 9\nbeta = 2\n"}, when=day(35), author="bob")
+    repo.commit({"a.py": "alpha = 9\nbeta = 99\n"}, when=day(65), author="bob")
+    return repo
+
+
+def test_churn_timeline_writes_gif(timeline_repo: RepoBuilder, tmp_path: Path) -> None:
+    gif = tmp_path / "timeline.gif"
+    assert main([str(timeline_repo.path), "--churn-timeline", str(gif)]) == 0
+    assert gif.read_bytes()[:4] == b"GIF8"
+
+
+def test_churn_timeline_bad_target_rejected(
+    churned_repo: RepoBuilder, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # .png is valid for the other plot flags but not for an animation.
+    for name in ("out.bmp", "out.png"):
+        code = main([str(churned_repo.path), "--churn-timeline", str(tmp_path / name)])
+        assert code == 2
+        assert "--churn-timeline" in capsys.readouterr().err
+
+
+def test_churn_timeline_no_data_fails_cleanly(
+    churned_repo: RepoBuilder, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main(
+        [
+            str(churned_repo.path),
+            "--since",
+            "2030-01-01",
+            "--churn-timeline",
+            str(tmp_path / "out.gif"),
+        ]
+    )
+    assert code == 1
+    assert "nothing to animate" in capsys.readouterr().err
+
+
+def test_churn_timeline_live_calls_show(
+    timeline_repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+    import matplotlib.pyplot as plt
+
+    calls: list[bool] = []
+    monkeypatch.setattr(plt, "show", lambda: calls.append(True))
+    assert main([str(timeline_repo.path), "--churn-timeline", "live"]) == 0
     assert calls == [True]
