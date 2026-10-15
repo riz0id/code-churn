@@ -4,6 +4,9 @@ import csv
 import io
 import json
 
+import pytest
+
+from code_churn.decay import DecayFit, GroupFit, LRTResult, StratifiedDecay
 from code_churn.formatters import render_csv, render_json, render_table
 from code_churn.model import (
     AnalysisConfig,
@@ -97,6 +100,80 @@ def test_csv_author_and_summary_sections() -> None:
     assert author_rows[1][0] == ALICE
     summary_rows = list(csv.reader(io.StringIO(render_csv(sample_report(), "summary"))))
     assert summary_rows[1] == ["10", "1", "0.1"]
+
+
+def stratified_report(lrt: LRTResult | None) -> RepoReport:
+    report = sample_report()
+    alice_fit = DecayFit(
+        lam=1 / (20 * 86_400),
+        half_life_seconds=20 * 86_400 * 0.6931,
+        events=1,
+        censored=1,
+        exposure_seconds=20 * 86_400,
+        caveats=("short history: oldest observation is 10.0 days",),
+    )
+    report.stratified_decay = StratifiedDecay(
+        group_by="author",
+        groups={
+            ALICE: GroupFit(
+                events=1,
+                censored=1,
+                exposure_seconds=20 * 86_400,
+                fit=alice_fit,
+            ),
+            BOB: GroupFit(events=0, censored=1, exposure_seconds=86_400, fit=None),
+        },
+        lrt=lrt,
+    )
+    return report
+
+
+def test_table_stratified_section_and_lrt_line() -> None:
+    lrt = LRTResult(statistic=6.21, df=1, p_value=0.0127)
+    out = render_table(stratified_report(lrt), ["summary"])
+    assert "decay by author:" in out
+    alice_row = next(line for line in out.splitlines() if line.startswith("alice"))
+    assert "13.9 days" in alice_row
+    bob_row = next(line for line in out.splitlines() if line.startswith("bob"))
+    assert "-" in bob_row  # no fit for the zero-death group
+    assert "caveat (alice <alice@example.com>): short history" in out
+    assert (
+        "likelihood-ratio test (shared λ vs per-group λ): "
+        "χ²=6.21, df=1, p=0.0127" in out
+    )
+
+
+def test_table_stratified_tiny_p_and_missing_lrt() -> None:
+    tiny = render_table(
+        stratified_report(LRTResult(statistic=30.0, df=2, p_value=0.0002)),
+        ["summary"],
+    )
+    assert "p<0.001" in tiny
+    missing = render_table(stratified_report(None), ["summary"])
+    assert "likelihood-ratio test: - (needs at least two groups with data)" in missing
+
+
+def test_json_stratified_payload() -> None:
+    lrt = LRTResult(statistic=6.21, df=1, p_value=0.0127)
+    payload = json.loads(render_json(stratified_report(lrt)))
+    stratified = payload["stratified_decay"]
+    assert stratified["group_by"] == "author"
+    # Sorted by (-events, label): alice's fitted group first.
+    groups = stratified["groups"]
+    assert [g["group"] for g in groups] == [ALICE, BOB]
+    assert groups[0]["events"] == 1
+    assert groups[0]["half_life_days"] == pytest.approx(20 * 0.6931)
+    assert groups[0]["caveats"] == ["short history: oldest observation is 10.0 days"]
+    assert groups[1]["half_life_days"] is None
+    assert groups[1]["lambda_per_day"] is None
+    assert groups[1]["exposure_days"] == 1.0
+    assert stratified["lrt"] == {"statistic": 6.21, "df": 1, "p_value": 0.0127}
+
+
+def test_json_stratified_null_lrt_and_absent_key() -> None:
+    payload = json.loads(render_json(stratified_report(None)))
+    assert payload["stratified_decay"]["lrt"] is None
+    assert "stratified_decay" not in json.loads(render_json(sample_report()))
 
 
 def test_empty_report_renders() -> None:

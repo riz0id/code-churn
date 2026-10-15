@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from code_churn.engine import analyze
-from code_churn.model import AnalysisConfig, AnalysisResult
+from code_churn.model import AnalysisConfig, AnalysisResult, GroupBy
 from tests.conftest import DAY, RepoBuilder, day
 
 WINDOW_DAYS = 30
@@ -17,6 +17,9 @@ def run(
     window_days: int = WINDOW_DAYS,
     since: int | None = None,
     until: int | None = None,
+    exclude: tuple[str, ...] = (),
+    collect_survival: bool = False,
+    survival_group_by: GroupBy | None = None,
 ) -> AnalysisResult:
     config = AnalysisConfig(
         repo_path=str(repo.path),
@@ -24,6 +27,9 @@ def run(
         window_seconds=window_days * DAY,
         since=since,
         until=until,
+        exclude=exclude,
+        collect_survival=collect_survival,
+        survival_group_by=survival_group_by,
     )
     return analyze(config)
 
@@ -238,6 +244,188 @@ def test_shrink_to_fit_recent_lines_count_fully(repo: RepoBuilder) -> None:
     repo.commit({"a.py": "recent = 2\n"}, when=day(97))
     result = run(repo, until=day(100))
     assert len(result.events) == 1
+
+
+def test_exclude_removes_added_and_churned(repo: RepoBuilder) -> None:
+    repo.commit(
+        {"gen/out.c": "generated_code();\n", "src.py": "handwritten = 1\n"},
+        when=day(0),
+    )
+    repo.commit(
+        {"gen/out.c": "regenerated_code();\n", "src.py": "handwritten = 2\n"},
+        when=day(10),
+    )
+    result = run(repo, exclude=("gen/**",))
+    # Only src.py contributes: its churn event and its 2 added lines.
+    assert len(result.events) == 1
+    assert result.events[0].origin_path == "src.py"
+    assert set(result.added) == {("src.py", "alice <alice@example.com>")}
+    assert sum(result.added.values()) == 2
+
+
+def test_exclude_glob_depth_semantics(repo: RepoBuilder) -> None:
+    repo.commit(
+        {"top.c": "top_level();\n", "gen/deep/x.c": "nested_code();\n"},
+        when=day(0),
+    )
+    # `**/*.c` matches at any depth; bare `*.c` matches top level only.
+    deep = run(repo, exclude=("**/*.c",))
+    assert deep.added == {}
+    shallow = run(repo, exclude=("*.c",))
+    assert set(shallow.added) == {("gen/deep/x.c", "alice <alice@example.com>")}
+
+
+def test_exclude_move_from_excluded_file_stays_excluded(repo: RepoBuilder) -> None:
+    # A line born in an excluded file, moved into an included one, keeps its
+    # excluded add-time path: never counted as added, its churn filtered.
+    repo.commit({"gen/out.c": "carried_over_line();\n"}, when=day(0))
+    repo.commit({"gen/out.c": None, "src.py": "carried_over_line();\n"}, when=day(5))
+    repo.commit({"src.py": "edited_line();\n"}, when=day(10))
+    result = run(repo, exclude=("gen/**",))
+    assert result.events == []
+    # The only counted add is day(10)'s replacement line, genuinely born in
+    # src.py; the carried line itself never entered the denominator.
+    assert result.added == {("src.py", "alice <alice@example.com>"): 1}
+
+
+def test_exclude_move_into_excluded_file_still_counts(repo: RepoBuilder) -> None:
+    # A line born in an included file was counted as added; churn after a
+    # move into an excluded file still counts (origin path decides).
+    repo.commit({"src.py": "carried_over_line();\n"}, when=day(0))
+    repo.commit({"src.py": None, "gen/out.c": "carried_over_line();\n"}, when=day(5))
+    repo.commit({"gen/out.c": "edited_line();\n"}, when=day(10))
+    result = run(repo, exclude=("gen/**",))
+    assert len(result.events) == 1
+    assert result.events[0].origin_path == "src.py"
+    assert result.events[0].path == "gen/out.c"
+    assert set(result.added) == {("src.py", "alice <alice@example.com>")}
+
+
+def test_survival_not_collected_by_default(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0))
+    assert run(repo).survival is None
+
+
+def test_survival_records_churn_outside_window(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0))
+    repo.commit({"a.py": "alpha = 2\n"}, when=day(40))
+    result = run(repo, collect_survival=True)
+    # Outside the 30-day window: no report event, but a death for the fit.
+    assert result.events == []
+    survival = result.survival
+    assert survival is not None
+    assert survival.event_lifetimes == [40 * DAY]
+    # The day(40) replacement line survives with age 0 at observation end.
+    assert survival.censored_ages == [0]
+
+
+def test_survival_censored_ages_measured_to_last_commit(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\nbeta = 2\n"}, when=day(0))
+    repo.commit({"a.py": "alpha = 1\nbeta = 99\n"}, when=day(10))
+    survival = run(repo, collect_survival=True).survival
+    assert survival is not None
+    assert survival.event_lifetimes == [10 * DAY]
+    # Survivors: alpha (born day 0) and beta's replacement (born day 10).
+    assert sorted(survival.censored_ages) == [0, 10 * DAY]
+
+
+def test_survival_walk_continues_past_until_plus_window(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0))
+    # Past until + window: the windowed walk stops before this commit, but
+    # survival collection must observe it as a death, not a survivor.
+    repo.commit({"a.py": "alpha = 2\n"}, when=day(40))
+    result = run(repo, until=day(1), collect_survival=True)
+    assert result.events == []
+    survival = result.survival
+    assert survival is not None
+    assert survival.event_lifetimes == [40 * DAY]
+    # The day(40) replacement is out of range: not a censored observation.
+    assert survival.censored_ages == []
+
+
+def test_survival_respects_exclusions(repo: RepoBuilder) -> None:
+    repo.commit(
+        {"gen/out.c": "generated_code();\n", "src.py": "handwritten = 1\n"},
+        when=day(0),
+    )
+    repo.commit({"gen/out.c": "regenerated_code();\n"}, when=day(10))
+    survival = run(repo, exclude=("gen/**",), collect_survival=True).survival
+    assert survival is not None
+    # Only src.py's surviving line counts; gen/** appears in neither list.
+    assert survival.event_lifetimes == []
+    assert survival.censored_ages == [10 * DAY]
+
+
+def test_survival_moved_line_keeps_original_clock(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "moved_function_call()\n"}, when=day(0))
+    repo.commit({"b.py": "moved_function_call()\n", "a.py": None}, when=day(5))
+    repo.commit({"b.py": "changed_function_call()\n"}, when=day(10))
+    survival = run(repo, collect_survival=True).survival
+    assert survival is not None
+    # Lifetime runs from the original add (day 0), not the move (day 5).
+    assert survival.event_lifetimes == [10 * DAY]
+
+
+def test_survival_by_group_not_collected_without_flag(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0))
+    assert run(repo).survival_by_group is None
+    assert run(repo, collect_survival=True).survival_by_group is None
+
+
+def test_survival_by_group_author(repo: RepoBuilder) -> None:
+    repo.commit({"a.py": "alpha = 1\n"}, when=day(0), author="alice")
+    repo.commit({"b.py": "bravo = 1\n"}, when=day(0), author="bob")
+    repo.commit({"a.py": "alpha = 2\n"}, when=day(10), author="bob")
+    result = run(repo, collect_survival=True, survival_group_by="author")
+
+    # Pooled survival is unchanged by grouping.
+    survival = result.survival
+    assert survival is not None
+    assert survival.event_lifetimes == [10 * DAY]
+    assert sorted(survival.censored_ages) == [0, 10 * DAY]
+
+    groups = result.survival_by_group
+    assert groups is not None
+    alice = groups["alice <alice@example.com>"]
+    bob = groups["bob <bob@example.com>"]
+    assert set(groups) == {"alice <alice@example.com>", "bob <bob@example.com>"}
+    # Alice's line died at day 10; she has no surviving lines.
+    assert alice.event_lifetimes == [10 * DAY]
+    assert alice.censored_ages == []
+    # Bob survives with b.py (10 days old) and the replacement line (0 days).
+    assert bob.event_lifetimes == []
+    assert sorted(bob.censored_ages) == [0, 10 * DAY]
+
+
+def test_survival_by_group_filetype(repo: RepoBuilder) -> None:
+    repo.commit(
+        {"a.py": "alpha = 1\n", "b.c": "bravo();\n", "Makefile": "all:\n"},
+        when=day(0),
+    )
+    repo.commit({"a.py": "alpha = 2\n"}, when=day(10))
+    groups = run(
+        repo, collect_survival=True, survival_group_by="filetype"
+    ).survival_by_group
+    assert groups is not None
+    assert set(groups) == {".py", ".c", "(no extension)"}
+    assert groups[".py"].event_lifetimes == [10 * DAY]
+    assert groups[".py"].censored_ages == [0]  # the replacement line
+    assert groups[".c"].censored_ages == [10 * DAY]
+    assert groups["(no extension)"].censored_ages == [10 * DAY]
+
+
+def test_survival_by_group_moved_line_keeps_origin_suffix(repo: RepoBuilder) -> None:
+    # The line is born in a .py file, moved verbatim into a .c file, then
+    # churned: the stratum follows the add-time path, so it dies in ".py".
+    repo.commit({"a.py": "moved_function_call()\n"}, when=day(0))
+    repo.commit({"b.c": "moved_function_call()\n", "a.py": None}, when=day(5))
+    repo.commit({"b.c": "changed_function_call()\n"}, when=day(10))
+    groups = run(
+        repo, collect_survival=True, survival_group_by="filetype"
+    ).survival_by_group
+    assert groups is not None
+    assert groups[".py"].event_lifetimes == [10 * DAY]
+    assert groups[".c"].event_lifetimes == []
 
 
 def test_multiple_repos_fixture(make_repo: Callable[[], RepoBuilder]) -> None:

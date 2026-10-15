@@ -19,6 +19,7 @@ walker must never use it.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
@@ -93,6 +94,11 @@ class OriginMap:
 
     def lines(self, path: str) -> list[LineOrigin]:
         return self._files.get(path, [])
+
+    def all_lines(self) -> Iterator[LineOrigin]:
+        """Every line origin in the tree as of the last applied commit."""
+        for origins in self._files.values():
+            yield from origins
 
     def apply_commit(
         self, patches: list[FilePatch], fresh: LineOrigin

@@ -9,7 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
+from code_churn.decay import DecayFit, StratifiedDecay, SurvivalData
+
 ChurnKind = Literal["modified", "deleted"]
+GroupBy = Literal["author", "filetype"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +51,11 @@ class AnalysisResult:
     events: list[ChurnEvent] = field(default_factory=list)
     # (add-time path, author) -> fresh lines added by in-range commits
     added: dict[tuple[str, str], int] = field(default_factory=dict)
+    # Lifetimes for decay fitting; only populated when the config asks for it.
+    survival: SurvivalData | None = None
+    # Same lifetimes keyed by group label; only populated when the config
+    # sets survival_group_by (alongside collect_survival).
+    survival_by_group: dict[str, SurvivalData] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +65,18 @@ class AnalysisConfig:
     window_seconds: int
     since: int | None  # epoch seconds, inclusive
     until: int | None  # epoch seconds, inclusive
+    # Gitignore-style globs (pathlib full-match: `**` recurses, `*` does not
+    # cross `/`) tested against a line's add-time path. Matching lines count
+    # neither as added nor as churned.
+    exclude: tuple[str, ...] = ()
+    # Collect survival data (lifetimes of churned and surviving in-range
+    # lines) for decay fitting. Ignores the window: the full history is
+    # walked so churn past `until + window` is observed, not miscounted as
+    # survival.
+    collect_survival: bool = False
+    # Additionally label survival data per group for stratified decay fits.
+    # Only takes effect when collect_survival is set.
+    survival_group_by: GroupBy | None = None
 
 
 @dataclass(slots=True)
@@ -87,6 +107,12 @@ class RepoReport:
     files: dict[str, GroupStats]  # keyed by path at the time lines were added
     authors: dict[str, AuthorStats]
     events: list[ChurnEvent]
+    # Fitted decay function; None when fitting was not requested (see
+    # config.collect_survival) or produced no fit (no churn events).
+    decay: DecayFit | None = None
+    # Per-group fits plus the shared-rate likelihood-ratio test; None when
+    # no grouping was requested (see config.survival_group_by).
+    stratified_decay: StratifiedDecay | None = None
 
     @property
     def total_events(self) -> int:

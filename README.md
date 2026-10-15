@@ -15,6 +15,11 @@ code-churn .                          # analyze the repo in the current director
 code-churn /path/to/repo --window 90d
 code-churn . --since 2025-01-01 --until 2025-06-30 --format json
 code-churn . --by author --format csv --output churn.csv
+code-churn . --exclude '**/*.ipynb' --exclude 'vendor/**'   # skip generated/vendored files
+code-churn . --fit-decay                                    # fit the repo's own decay timescale
+code-churn . --decay-plot churn-decay.png                   # ...and graph it (.png/.svg/.pdf)
+code-churn . --group-by author                              # per-group fits + likelihood-ratio test
+code-churn . --churn-heatmap churn.png                      # cross-author churn matrix ('live' for a window)
 ```
 
 Build and run the packaged application:
@@ -36,6 +41,80 @@ nix build
 
 Output formats: human-readable table (default), `--format json` (includes the
 individual churn events), `--format csv`.
+
+## Fitting a decay function
+
+The fixed `--window` is a step function: churn at day 29 counts, day 31
+doesn't, and 30 days is arbitrary for any given repo. `--fit-decay` instead
+discovers the repo's own decay timescale by treating line survival as a
+censored survival problem:
+
+- every churned line is an observed **death** with exact lifetime
+  (churn time − add time);
+- every line still alive at the end of the walk is **right-censored** — it
+  survived at least its current age.
+
+For an exponential model `S(t) = exp(−λt)` this has a closed-form
+maximum-likelihood fit: `λ = deaths / total exposure`, where total exposure is
+the sum of all death lifetimes plus all censored ages. The reported half-life
+is `ln(2)/λ`, and the fitted weight `exp(−λ·Δt)` is the smooth replacement for
+the window's hard cutoff.
+
+Details:
+
+- **Fitting ignores `--window`** and walks the full history even past
+  `--until`, so churn landing after the window is observed as a late death
+  rather than miscounted as survival. `--since`/`--until` still select which
+  lines (by origin commit) participate; `--exclude` applies as usual.
+- The fit appears in the table summary and under `"decay"` in JSON
+  (`half_life_days`, `lambda_per_day`, `events`, `censored`, `exposure_days`,
+  `caveats`).
+- **Caveats, not silence**: the fit is flagged when the observed history is
+  shorter than 30 days, or the half-life extrapolates past 4× the oldest
+  observation.
+- `--decay-plot PATH` (implies `--fit-decay`) writes a graph to PATH: the
+  model-free Kaplan–Meier survival curve of the observed data with the fitted
+  exponential overlaid, plus half-life guides — if the two curves diverge
+  badly, the exponential assumption is wrong for your repo. Format follows
+  the extension (`.png`, `.svg`, `.pdf`).
+
+### Stratified fits: does a variable change the lifetime?
+
+`--group-by author` (or `--group-by filetype`, implies `--fit-decay`) fits one
+decay rate per group and tests whether the grouping variable actually affects
+the fitted lifetime, via a likelihood-ratio test of the shared-rate model
+against the per-group model. Both MLEs are closed-form, so the statistic is
+`2·(Σ_g d_g·ln(d_g/E_g) − D·ln(D/E))` with `df = G − 1` (`d` = churn events,
+`E` = exposure per group):
+
+```
+decay by author:
+group                      half-life   λ/day    events  surviving
+alice <alice@example.com>  13.9 days   0.0500   12      30
+bob <bob@example.com>      46.2 days   0.0150   3       41
+likelihood-ratio test (shared λ vs per-group λ): χ²=6.21, df=1, p=0.0127
+```
+
+A small p-value (conventionally < 0.05) means the groups' code decays at
+genuinely different rates — the half-life differences are signal, not noise.
+Groups with no churn events are listed (half-life `-`) and still contribute
+their exposure to the test. JSON output carries the same data under
+`"stratified_decay"` (`groups` + `lrt`).
+
+### Cross-author churn heatmap
+
+`--churn-heatmap TARGET` renders a matrix of churn counts — the line's
+original author on rows, the churning author on columns, so the diagonal is
+self-churn and off-diagonal cells show whose code gets reworked by whom.
+TARGET is an image path (`.png`/`.svg`/`.pdf`) or the literal `live` to open
+an interactive matplotlib window:
+
+```sh
+code-churn . --churn-heatmap churn.png
+code-churn . --churn-heatmap live
+```
+
+Axes are truncated to the 20 most-involved authors when there are more.
 
 ## How churn is measured
 
@@ -62,6 +141,16 @@ individual churn events), `--format csv`.
   brought in by a merge commit is attributed to the merge's author and
   timestamp. With squash/rebase workflows this is exact; with merge-commit
   workflows it is the standard trade-off.
+- **`--exclude GLOB` filters by add-time path.** Patterns are gitignore-style
+  globs (pathlib full-match semantics): `*` stays within one path segment,
+  `**` recurses — so `--exclude '**/*.c'` matches C files at any depth while
+  `--exclude '*.c'` matches only the top level. A line whose add-time path
+  matches (the same path the per-file report keys on) counts neither as added
+  nor as churned. Useful for committed generated artifacts, which otherwise
+  dominate churn rates. Two move-boundary consequences: a line born in an
+  excluded file stays excluded even after being moved into an included file,
+  and a line born in an included file still counts if it churns after moving
+  into an excluded one.
 - Binary files are skipped. When git's binary detection flips for a file
   across history (e.g. added as "binary", later diffed as text), lines from
   the untracked period simply have no provenance: they never count as added

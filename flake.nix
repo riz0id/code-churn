@@ -27,6 +27,7 @@
       # Add packages from nixpkgs' python3Packages set.
       projectDeps = ps: with ps; [
         pygit2
+        matplotlib # decay-curve plotting (--decay-plot)
       ];
 
       # Dev-shell-only dependencies (tests, tooling) — not part of the
